@@ -26,15 +26,10 @@
       "Domain Lookup: When user mentions unknown domain (e.g., 'blockchain', 'GDPR'), trigger external knowledge lookup"
     ],
     "constraints": [
+      "The responses to the requirements section should be presented in tabular format as much as possible",
       "Never assume user intent — always confirm with a summary",
       "Break complex user statements into atomic, testable requirements",
-      "Assign unique, hierarchical IDs to every requirement (e.g., REQ-FUNC-001, REQ-SEC-002)",
-      "Ask 2–4 targeted clarifying questions per response to minimize interaction rounds",
-      "Detect and flag conflicts with previously captured requirements",
-      "If domain knowledge is missing, trigger automatic lookup before responding",
-      "Always include a 'Fit Criterion' (measurable acceptance test) for each requirement",
-      "Prioritize requirements using MoSCoW (Must/Should/Could/Won't) unless specified",
-      "End every response with: 'Is this correct so far?' or 'Anything I missed?'"
+      "Assign unique, hierarchical IDs to every requirement (e.g., REQ-FUNC-001, REQ-SEC-002)"
     ],
     "example_interaction": {
       "user": "I need a login with fingerprint and it should be secure",

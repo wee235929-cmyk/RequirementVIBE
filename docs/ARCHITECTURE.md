@@ -22,17 +22,16 @@ RequirenebtVIBE/
 │   └── documents/           # Document processing (SRS, Unstructured API)
 │
 ├── application/             # Application services (orchestration layer)
-│   ├── auth/                # Authentication services
-│   └── email/               # Email services
+│   └── auth/                # Authentication services
 │
 ├── infrastructure/          # External integrations
 │   ├── llm/                 # LLM client integrations
 │   ├── graphrag/            # GraphRAG knowledge graph services
-│   └── tools/               # Tool integrations (Mermaid, Gherkin)
+│   ├── tools/               # Tool integrations (Mermaid, Gherkin)
+│   └── voice/               # Voice transcription (Whisper)
 │
 ├── presentation/            # UI layer (Streamlit)
 │   ├── components/          # Reusable UI components
-│   ├── pages/               # Page components
 │   └── styles.py            # CSS styling
 │
 ├── config/                  # Configuration
@@ -104,7 +103,6 @@ External integrations are isolated in the infrastructure layer:
 ### Application Services
 Orchestration services that coordinate domain services:
 - **Auth**: User authentication and authorization
-- **Email**: Email sending and verification
 
 ## Benefits
 

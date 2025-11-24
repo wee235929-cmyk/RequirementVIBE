@@ -47,7 +47,6 @@ All configuration is read from a `.env` file in the project root (automatically 
 | Variable | Description |
 |----------|-------------|
 | `UNSTRUCTURED_API_URL` | Custom Unstructured endpoint, defaults to `https://api.unstructured.io/general/v0/general` |
-| `RESEND_API_KEY` | Enables transactional emails (password reset, verification) |
 | `LANGSMITH_TRACING`, `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`, `LANGSMITH_ENDPOINT` | Enable LangSmith observability |
 | `VOICE_TRANSCRIBE_MODEL`, `VOICE_TRANSCRIBE_LANGUAGE`, `VOICE_TRANSCRIBE_TEMPERATURE` | Override default Whisper transcription settings |
 
@@ -62,7 +61,6 @@ UNSTRUCTURED_API_KEY=your_key
 # UNSTRUCTURED_API_URL=https://api.unstructured.io/general/v0/general
 
 # Optional services
-# RESEND_API_KEY=your_resend_key
 # LANGSMITH_TRACING=true
 # LANGSMITH_API_KEY=your_langsmith_key
 

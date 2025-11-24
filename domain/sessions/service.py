@@ -46,13 +46,17 @@ def create_new_session() -> str:
         prev_session["model"] = st.session_state.selected_model  # Save model used in this session
         st.session_state.sessions[st.session_state.current_session_id] = prev_session
     
+    # Import greeting utility to assign a greeting to the new session
+    from utils.greetings import get_random_greeting
+    
     # Create new session entry with initial state
     st.session_state.sessions[session_id] = {
         "id": session_id,                                    # Unique identifier
         "messages": [],                                      # Empty chat history
         "title": f"New Chat {st.session_state.session_counter + 1}",  # Default title (updated from first message)
         "created_at": datetime.now().isoformat(),            # Timestamp for sorting (ISO format for JSON)
-        "model": st.session_state.selected_model             # Model selected for this session
+        "model": st.session_state.selected_model,           # Model selected for this session
+        "greeting": get_random_greeting()                    # Random greeting for this session
     }
     st.session_state.session_counter += 1
     st.session_state.current_session_id = session_id
