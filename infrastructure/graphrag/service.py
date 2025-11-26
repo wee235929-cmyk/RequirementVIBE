@@ -345,8 +345,19 @@ def process_uploaded_documents(structured_docs: Dict[str, Any]) -> Dict[str, Any
             if isinstance(element, dict):
                 text = element.get('text', '')
                 element_type = element.get('type', 'unknown')
+                metadata = element.get('metadata', {}) if isinstance(element.get('metadata', {}), dict) else {}
+                source_name = metadata.get('source_filename', doc_name)
+                source_type = metadata.get('source_type', element_type)
+                page_number = metadata.get('page_number')
                 if text:
-                    doc_text_parts.append(f"[{element_type}] {text}")
+                    prefix_parts = [
+                        f"Source: {source_name}",
+                        f"Type: {source_type}",
+                        f"Element: {element_type}",
+                    ]
+                    if page_number:
+                        prefix_parts.append(f"Page: {page_number}")
+                    doc_text_parts.append(f"[{' | '.join(prefix_parts)}]\n{text}")
         
         # Combine all text
         full_text = "\n\n".join(doc_text_parts)
@@ -764,21 +775,63 @@ def is_document_related_query(query: str) -> bool:
     """
     Determine if a query is likely related to uploaded documents.
     
+    This function uses a language-agnostic approach:
+    1. Checks for English keywords (for backward compatibility)
+    2. Checks for Chinese question patterns
+    3. If query has substantial content (not just greetings), considers it document-related
+    
     Args:
-        query: User query string
+        query: User query string (can be in any language)
         
     Returns:
         True if query seems document-related
     """
-    query_lower = query.lower()
+    if not query or len(query.strip()) < 2:
+        return False
     
-    # Keywords that suggest document-related queries
-    doc_keywords = [
+    query_lower = query.lower()
+    query_stripped = query.strip()
+    
+    # English keywords that suggest document-related queries
+    english_keywords = [
         'document', 'requirement', 'specification', 'spec', 'req',
         'what does', 'what is', 'explain', 'describe', 'tell me about',
         'according to', 'in the document', 'from the document',
         'what are', 'list', 'show me', 'find', 'where is'
     ]
     
-    return any(keyword in query_lower for keyword in doc_keywords)
+    # Chinese keywords and patterns that suggest document-related queries
+    chinese_keywords = [
+        '文档', '需求', '规格', '说明', '要求',  # document, requirement, specification, description, requirement
+        '什么', '哪些', '如何', '怎样', '为什么',  # what, which, how, how, why
+        '解释', '描述', '说明', '列出', '找到',  # explain, describe, explain, list, find
+        '根据', '按照', '文档中', '文件中',  # according to, according to, in document, in file
+        '是什么', '有哪些', '在哪里',  # what is, what are, where is
+    ]
+    
+    # Check for English keywords
+    if any(keyword in query_lower for keyword in english_keywords):
+        return True
+    
+    # Check for Chinese keywords (case-insensitive for mixed case)
+    if any(keyword in query_stripped for keyword in chinese_keywords):
+        return True
+    
+    # Language-agnostic heuristics:
+    # If query contains question marks (English or Chinese), it's likely a question
+    if '?' in query or '？' in query:
+        # Exclude simple greetings
+        greetings = ['hello', 'hi', 'hey', '你好', '您好', '嗨']
+        if not any(greeting in query_lower or greeting in query_stripped for greeting in greetings):
+            return True
+    
+    # If query is substantial (more than just a greeting), consider it document-related
+    # This helps with non-English queries that don't match keywords
+    if len(query_stripped) > 5:
+        # Exclude common greetings and short responses
+        short_responses = ['ok', 'yes', 'no', 'thanks', 'thank you', '好的', '是的', '不是', '谢谢']
+        if not any(response in query_lower or response in query_stripped for response in short_responses):
+            return True
+    
+    return False
 

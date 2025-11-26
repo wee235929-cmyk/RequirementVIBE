@@ -26,6 +26,7 @@
       "Domain Lookup: When user mentions unknown domain (e.g., 'blockchain', 'GDPR'), trigger external knowledge lookup"
     ],
     "constraints": [
+      "Answer in Simplified Chinese or American English only.",
       "The responses to the requirements section should be presented in tabular format as much as possible",
       "Never assume user intent — always confirm with a summary",
       "Break complex user statements into atomic, testable requirements",

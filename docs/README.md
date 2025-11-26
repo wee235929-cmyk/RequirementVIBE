@@ -40,13 +40,16 @@ All configuration is read from a `.env` file in the project root (automatically 
 | Variable | Description | Example |
 |----------|-------------|---------|
 | `CENTRALIZED_LLM_API_KEY` | API key for the centralized LLM gateway that proxies DeepSeek/OpenAI-compatible providers | `CENTRALIZED_LLM_API_KEY=sk-xxxxx` |
-| `UNSTRUCTURED_API_KEY` | API key for the Unstructured.io document processing service | `UNSTRUCTURED_API_KEY=uzzzzz` |
 
 ### Optional (enable only what you need)
 
 | Variable | Description |
 |----------|-------------|
+| `REQVIBE_USE_UNSTRUCTURED_API` | Set to `1` to bypass Docling and call the legacy Unstructured API |
+| `UNSTRUCTURED_API_KEY` | API key for the Unstructured.io service (only needed when the legacy fallback is enabled) |
 | `UNSTRUCTURED_API_URL` | Custom Unstructured endpoint, defaults to `https://api.unstructured.io/general/v0/general` |
+| `RAPIDOCR_HOME` | Custom cache directory for RapidOCR model downloads (useful on Streamlit cloud) |
+| `HF_HOME`, `HF_HUB_CACHE` | Custom Hugging Face cache directories so Docling models download to a writable path |
 | `LANGSMITH_TRACING`, `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`, `LANGSMITH_ENDPOINT` | Enable LangSmith observability |
 | `VOICE_TRANSCRIBE_MODEL`, `VOICE_TRANSCRIBE_LANGUAGE`, `VOICE_TRANSCRIBE_TEMPERATURE` | Override default Whisper transcription settings |
 
@@ -56,8 +59,9 @@ All configuration is read from a `.env` file in the project root (automatically 
 # LLM Gateway
 CENTRALIZED_LLM_API_KEY=your_key
 
-# Document processing
-UNSTRUCTURED_API_KEY=your_key
+# Document processing (Docling is default)
+# REQVIBE_USE_UNSTRUCTURED_API=0
+# UNSTRUCTURED_API_KEY=your_key
 # UNSTRUCTURED_API_URL=https://api.unstructured.io/general/v0/general
 
 # Optional services
@@ -72,6 +76,7 @@ UNSTRUCTURED_API_KEY=your_key
 
 > **Never commit the `.env` file.** It is already excluded by `.gitignore`.
 
+When deploying to Streamlit Cloud, set `RAPIDOCR_HOME`, `HF_HOME`, and `HF_HUB_CACHE` to a folder inside your repo (for example `/mount/src/RequirementVIBE/.cache/…`) so Docling can download OCR/model files without requiring elevated permissions.  
 To set variables manually without `.env`, use your shell’s syntax (`$env:VAR="value"` in PowerShell, `export VAR=value` in Bash/Zsh, etc.).
 
 ## Memory Architecture Snapshot
@@ -123,13 +128,15 @@ To deploy this app to Streamlit Cloud:
 3. Sign in with your GitHub account
 4. Click "New app" and select your repository
 5. Set the main file path to: `app.py`
-6. Add your required secrets (at minimum `CENTRALIZED_LLM_API_KEY`, plus anything like `UNSTRUCTURED_API_KEY`)
+6. Add your required secrets (at minimum `CENTRALIZED_LLM_API_KEY`; add `REQVIBE_USE_UNSTRUCTURED_API` and `UNSTRUCTURED_API_KEY` only if you want the legacy API fallback)
 7. Click "Deploy"
 
 **Important:** Set secrets in Streamlit Cloud (not in the code), for example:
 ```
 CENTRALIZED_LLM_API_KEY = "YOUR_GATEWAY_KEY"
-UNSTRUCTURED_API_KEY = "YOUR_DOC_KEY"
+# Optional legacy fallback
+# REQVIBE_USE_UNSTRUCTURED_API = "1"
+# UNSTRUCTURED_API_KEY = "YOUR_DOC_KEY"
 ```
 
 For detailed deployment instructions, see [DEPLOYMENT.md](docs/DEPLOYMENT.md).
@@ -144,6 +151,7 @@ For detailed deployment instructions, see [DEPLOYMENT.md](docs/DEPLOYMENT.md).
 - ✅ Responsive UI with Streamlit chat interface
 - ✅ IEEE 830 SRS document generation
 - ✅ Context summarization for long conversations
+- ✅ Docling-based document ingestion with per-file JSON exports for reuse
 
 ## Extending with Other API Providers
 

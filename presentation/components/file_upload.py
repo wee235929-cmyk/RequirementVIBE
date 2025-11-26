@@ -2,27 +2,31 @@
 File Upload Component for ReqVibe
 
 This module provides a secure file upload component for Streamlit that:
-- Supports PDF, Word (.docx), ReqIF (.reqif), and JSON (vectorized documents) formats
+- Supports PDF, Word (.docx), Excel (.xlsx), PowerPoint (.pptx), Markdown (.md),
+  AsciiDoc (.adoc), HTML/XHTML, CSV, and common image formats (PNG/JPEG/TIFF/BMP/WEBP)
+  alongside ReqIF (.reqif) and vectorized JSON documents
 - Allows multiple file uploads
 - Enforces 10MB total size limit
 - Shows clear error messages
-- Processes files using Unstructured API
+- Processes files locally using Docling to preserve complex layouts
 - Detects and uses vectorized JSON documents directly without reprocessing
 """
 
 import streamlit as st
 from typing import List, Dict, Any, Optional, Tuple
-import tempfile
 import os
 import json
+import io
+import zipfile
+from datetime import datetime
 
 # Domain Services
 from domain.documents.unstructured import (
     process_multiple_documents,
     validate_file,
     UnstructuredServiceError,
-    get_unstructured_api_key,
-    MAX_FILE_SIZE
+    MAX_FILE_SIZE,
+    create_single_document_json
 )
 
 
@@ -31,7 +35,7 @@ def render_file_upload():
     Render the file upload component in the sidebar.
     
     This component allows users to upload documents for processing
-    and automatically processes them using the Unstructured API.
+    and automatically processes them locally via Docling.
     """
     st.markdown(
         "<div style='margin-top: 1.5rem; margin-bottom: 1rem;'>"
@@ -47,11 +51,18 @@ def render_file_upload():
         return
     
     # File uploader
+    supported_types = [
+        "pdf", "docx", "xlsx", "pptx", "md", "adoc", "html", "xhtml",
+        "csv", "png", "jpg", "jpeg", "tiff", "bmp", "webp", "reqif", "json"
+    ]
     uploaded_files = st.file_uploader(
         "Upload Documents",
-        type=["pdf", "docx", "reqif", "json"],
+        type=supported_types,
         accept_multiple_files=True,
-        help="Upload PDF, Word (.docx), ReqIF (.reqif), or vectorized JSON files. Maximum 10MB total.",
+        help=(
+            "Upload PDF, DOCX, XLSX, PPTX, Markdown, AsciiDoc, HTML/XHTML, CSV, "
+            "PNG/JPEG/TIFF/BMP/WEBP, ReqIF, or vectorized JSON files. Maximum 10MB total."
+        ),
         key="file_uploader"
     )
     
@@ -202,12 +213,12 @@ def combine_vectorized_results(results_list: List[Dict[str, Any]]) -> Dict[str, 
 
 def process_uploaded_files(uploaded_files: List):
     """
-    Process uploaded files using Unstructured API or use vectorized JSON directly.
+    Process uploaded files using Docling or reuse vectorized JSON directly.
     
     This function:
     1. Separates JSON files from other files
     2. Validates JSON files to check if they're vectorized documents
-    3. Processes non-JSON files with UNSTRUCTURED API
+    3. Processes non-JSON files with Docling
     4. Combines all vectorized JSON files (from upload + from processing) for Q&A
     
     Args:
@@ -245,56 +256,46 @@ def process_uploaded_files(uploaded_files: List):
             st.warning(f"- {filename}: {error_msg}")
         st.info("These files will be skipped. Please ensure they are valid vectorized JSON documents from previous processing.")
     
-    # Process non-JSON files with UNSTRUCTURED API if any
+    # Process non-JSON files with Docling if any
     processed_results = None
+    individual_jsons = []
     if non_json_files:
-        # Check if API key is set
-        try:
-            get_unstructured_api_key()
-        except UnstructuredServiceError as e:
-            st.error(str(e))
-            st.info(
-                "To use document processing, please set the UNSTRUCTURED_API_KEY "
-                "environment variable with your API key."
-            )
-            # If we have valid vectorized JSON, we can still use those
-            if vectorized_results:
-                st.info("Note: You can still use the uploaded vectorized JSON files for Q&A.")
-            return
-        
-        # Prepare files for processing
         files_to_process = []
         for file in non_json_files:
             file_bytes = file.getvalue()
             files_to_process.append((file_bytes, file.name))
         
-        # Process files
         try:
-            with st.spinner("Processing documents with UNSTRUCTURED API... This may take a few moments."):
-                processed_results = process_multiple_documents(files_to_process, strategy="fast")
+            with st.spinner("Processing documents with Docling... This may take a few moments."):
+                processed_results, individual_jsons = process_multiple_documents(
+                    files_to_process,
+                    strategy="fast",
+                    return_individual=True
+                )
         except UnstructuredServiceError as e:
             st.session_state.document_processing_error = str(e)
             st.error(f"Error processing documents: {str(e)}")
-            # If we have valid vectorized JSON, we can still use those
             if vectorized_results:
                 st.info("Note: You can still use the uploaded vectorized JSON files for Q&A.")
             return
         except Exception as e:
             st.session_state.document_processing_error = str(e)
             st.error(f"Unexpected error: {str(e)}")
-            # If we have valid vectorized JSON, we can still use those
             if vectorized_results:
                 st.info("Note: You can still use the uploaded vectorized JSON files for Q&A.")
             return
     
     # Combine all results (vectorized JSON + processed documents)
     all_results = []
+    all_individual_jsons = []
     
     if vectorized_results:
         all_results.extend(vectorized_results)
+        all_individual_jsons.extend(vectorized_results)
     
     if processed_results:
         all_results.append(processed_results)
+        all_individual_jsons.extend(individual_jsons)
     
     # If we have no results at all, show error
     if not all_results:
@@ -308,6 +309,17 @@ def process_uploaded_files(uploaded_files: List):
         # Store results in session state
         st.session_state.document_processing_results = combined_results
         st.session_state.document_processing_error = None
+        
+        # Persist individual JSONs for download
+        per_doc_json: Dict[str, Dict[str, Any]] = {}
+        for json_blob in all_individual_jsons:
+            docs = json_blob.get('documents') or []
+            if not docs:
+                continue
+            filename = docs[0].get('filename', 'document')
+            safe_name = os.path.splitext(filename)[0] or 'document'
+            per_doc_json[f"{safe_name}_processed.json"] = json_blob
+        st.session_state.document_individual_jsons = per_doc_json
         
         # Also store formatted output for easy access
         from domain.documents.unstructured import format_structured_output
@@ -375,16 +387,32 @@ def display_processing_results():
         with st.expander("View Structured Output", expanded=False):
             st.text(st.session_state.document_processing_formatted)
     
-    # Option to download results as JSON
-    import json
-    results_json = json.dumps(results, indent=2, default=str)
+    # Allow downloading per-document JSONs as a ZIP
+    if st.session_state.get("document_individual_jsons"):
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for filename, json_blob in st.session_state.document_individual_jsons.items():
+                zf.writestr(filename, json.dumps(json_blob, indent=2, ensure_ascii=False))
+        zip_buffer.seek(0)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        st.download_button(
+            label=f"Download Individual Results (ZIP - {len(st.session_state.document_individual_jsons)} files)",
+            data=zip_buffer.getvalue(),
+            file_name=f"docling_results_{timestamp}.zip",
+            mime="application/zip",
+            use_container_width=True,
+            key="download_results_zip"
+        )
+    
+    # Also provide the combined JSON for backward compatibility
+    results_json = json.dumps(results, indent=2, ensure_ascii=False)
     st.download_button(
-        label="Download Results (JSON)",
+        label="Download Combined Results (JSON)",
         data=results_json,
-        file_name="document_processing_results.json",
+        file_name="document_processing_results_combined.json",
         mime="application/json",
         use_container_width=True,
-        key="download_results_button"
+        key="download_results_combined"
     )
     
     # Note: GraphRAG is now automatically available for document-related questions

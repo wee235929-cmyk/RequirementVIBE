@@ -77,6 +77,12 @@ if os.path.exists(env_path):
     # Only load once to avoid redundant parsing when Streamlit reruns scripts
     load_dotenv(dotenv_path=env_path, override=False)
 
+# Setup cache directories for document processing (MUST be before importing document processing)
+# This ensures Docling, RapidOCR, and Hugging Face models download to writable locations
+# Set silent=True to avoid logging on every rerun (will log once per session via session state)
+from domain.documents.unstructured import setup_cache_directories
+setup_cache_directories(project_root=_project_root, silent=False)  # Will only log once per session
+
 import streamlit as st
 import copy
 import time
@@ -336,7 +342,7 @@ if user_input:
                 answer_question_with_graphrag
             )
             
-            # Check if query is document-related
+            # Check if query is document-related (now supports multiple languages including Chinese)
             if is_document_related_query(user_input):
                 try:
                     # Reconstruct GraphRAG index from serialized data

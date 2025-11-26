@@ -97,6 +97,52 @@ git commit -m "Let Whisper download model at runtime"
 git push origin main
 ```
 
+## Document Processing on Streamlit Cloud
+
+### Automatic Cache Configuration
+
+The app **automatically configures cache directories** for document processing tools (Docling, RapidOCR, Hugging Face models) when deployed to Streamlit Cloud. This ensures models can be downloaded to writable locations without permission issues.
+
+**How it works**:
+1. The app detects if it's running on Streamlit Cloud (checks for `/mount/src` directory)
+2. Automatically finds your repository name
+3. Creates `.cache/` directories in your project root
+4. Sets environment variables (`RAPIDOCR_HOME`, `HF_HOME`, `HF_HUB_CACHE`) to point to these directories
+5. All model downloads go to writable locations within your repo
+
+**No manual configuration needed** - the app handles this automatically!
+
+### Manual Override (Advanced)
+
+If you need to override the automatic configuration, you can set these environment variables in Streamlit Cloud Secrets:
+
+```toml
+RAPIDOCR_HOME = "/mount/src/RequirementVIBE/.cache/rapidocr"
+HF_HOME = "/mount/src/RequirementVIBE/.cache/huggingface"
+HF_HUB_CACHE = "/mount/src/RequirementVIBE/.cache/huggingface/hub"
+```
+
+**Note**: Replace `RequirementVIBE` with your actual repository name.
+
+### Troubleshooting Document Processing
+
+**Issue**: Document processing fails with permission errors
+
+**Solution**:
+1. Check that `.cache/` directory is not in `.gitignore` (it should be ignored)
+2. Verify the app logs show cache directories being configured
+3. If using manual override, ensure paths match your repository name
+4. Restart the app after changing environment variables
+
+**Issue**: Models download slowly on first use
+
+**Solution**: This is normal! Models are cached after first download:
+- Docling layout model (~500MB) - downloaded once
+- RapidOCR models (~3MB) - downloaded once
+- SentenceTransformer embeddings (~80MB) - downloaded once
+
+Subsequent document processing will be faster.
+
 ## Troubleshooting
 
 ### Repository fails to clone
@@ -125,14 +171,44 @@ git push origin main
 
 ## Environment Variables
 
+### Required Variables
+
 At minimum set:
 
 | Variable | Where to set | Purpose |
 |----------|--------------|---------|
 | `DEEPSEEK_API_KEY` | Streamlit Cloud → Secrets | LLM access |
 | `CENTRALIZED_LLM_API_KEY` | `.env` or Secrets | Gateway key (if different from DeepSeek) |
-| `UNSTRUCTURED_API_KEY` | `.env` or Secrets | Document processing |
-| `VOICE_TRANSCRIBE_*` | Optional | Override Whisper defaults |
+| `UNSTRUCTURED_API_KEY` | `.env` or Secrets | Document processing (only if using Unstructured API fallback) |
+
+### Optional Variables
+
+| Variable | Where to set | Purpose |
+|----------|--------------|---------|
+| `VOICE_TRANSCRIBE_*` | `.env` or Secrets | Override Whisper defaults |
+| `RAPIDOCR_HOME` | `.env` or Secrets | Custom RapidOCR cache directory (auto-configured if not set) |
+| `HF_HOME` | `.env` or Secrets | Custom Hugging Face cache directory (auto-configured if not set) |
+| `HF_HUB_CACHE` | `.env` or Secrets | Custom Hugging Face Hub cache directory (auto-configured if not set) |
+
+### Document Processing Cache Configuration
+
+**Important for Streamlit Cloud**: The app automatically configures cache directories for document processing (Docling, RapidOCR, Hugging Face models). 
+
+**Automatic Configuration**:
+- The app detects if it's running on Streamlit Cloud (`/mount/src` exists)
+- Automatically creates `.cache/` directories in the project root
+- Sets `RAPIDOCR_HOME`, `HF_HOME`, and `HF_HUB_CACHE` to writable locations
+- No manual configuration needed in most cases
+
+**Manual Override** (if needed):
+If you need to override the automatic configuration, set these in Streamlit Cloud Secrets:
+```toml
+RAPIDOCR_HOME = "/mount/src/RequirementVIBE/.cache/rapidocr"
+HF_HOME = "/mount/src/RequirementVIBE/.cache/huggingface"
+HF_HUB_CACHE = "/mount/src/RequirementVIBE/.cache/huggingface/hub"
+```
+
+**Note**: Replace `RequirementVIBE` with your actual repository name if different.
 
 ## Custom Domain (Optional)
 

@@ -78,3 +78,7 @@ tests/
 models/whisper/base.pt
 *.pt
 
+# Local Docling regression artifacts
+doclingtest/
+.cache/
+

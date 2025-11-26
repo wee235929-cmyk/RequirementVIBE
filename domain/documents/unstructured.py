@@ -1,19 +1,19 @@
 """
-Unstructured API Service for Document Processing
+Document Processing Service (Docling-first with legacy Unstructured API fallback)
 
-This service handles document processing using Unstructured Serverless API.
-It supports multiple file formats (PDF, Word, ReqIF) and processes them
-using the partition pipeline to extract structured content.
-
-Uses the official unstructured-client Python SDK for better SSL handling.
+This service now uses the open-source Docling converter to process PDFs, Word, and ReqIF files
+locally so layout-heavy artifacts (images, tables) remain intact for downstream GraphRAG usage.
+The legacy Unstructured Serverless API implementation is preserved as a fallback that can be
+explicitly enabled via environment variable.
 """
 
 import os
-import io
-from typing import List, Dict, Any, Optional
+import shutil
+from typing import List, Dict, Any, Optional, Tuple, Union
 import json
 import time
 import warnings
+import tempfile
 
 # Always import requests (needed for fallback and type hints)
 import requests
@@ -28,6 +28,30 @@ except ImportError:
         InsecureRequestWarning = getattr(urllib3.exceptions, 'InsecureRequestWarning', None)
     except (ImportError, AttributeError):
         InsecureRequestWarning = None
+
+# Try to import Docling (preferred open-source processor)
+try:
+    from docling.document_converter import DocumentConverter
+    HAS_DOCLING = True
+except ImportError:
+    HAS_DOCLING = False
+
+# Hugging Face cache helpers (used to repair corrupted model downloads)
+# Priority: Environment variable > huggingface_hub default > fallback
+HF_HUB_CACHE = os.getenv("HF_HUB_CACHE")
+if not HF_HUB_CACHE:
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE as _HF_HUB_CACHE
+        HF_HUB_CACHE = _HF_HUB_CACHE
+    except ImportError:
+        # Fallback: use environment variable HF_HOME or default location
+        HF_HOME = os.getenv("HF_HOME")
+        if HF_HOME:
+            HF_HUB_CACHE = os.path.join(HF_HOME, "hub")
+        else:
+            HF_HUB_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
+
+DOCLING_LAYOUT_MODEL_REPO = "docling-project/docling-layout-heron"
 
 # Try to import the official SDK, fall back to requests if not available
 try:
@@ -52,11 +76,405 @@ UNSTRUCTURED_API_URL = os.getenv(
     "https://api.unstructured.io/general/v0/general"  # Fallback to common URL
 )
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB in bytes
+USE_UNSTRUCTURED_API_FALLBACK = os.getenv("REQVIBE_USE_UNSTRUCTURED_API", "").lower() in {"1", "true", "yes"}
+
+# Supported document extensions for Docling ingestion (keep lowercase with leading dot)
+SUPPORTED_UPLOAD_EXTENSIONS = {
+    '.pdf', '.docx', '.xlsx', '.pptx',
+    '.md', '.markdown', '.adoc', '.asciidoc',
+    '.html', '.htm', '.xhtml',
+    '.csv',
+    '.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp', '.webp',
+    '.reqif'
+}
+
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.gif', '.webp', '.heic'}
+
+
+def _infer_source_type(file_extension: str) -> str:
+    ext = (file_extension or '').lower()
+    if ext in IMAGE_EXTENSIONS:
+        return 'image'
+    if ext in {'.pdf'}:
+        return 'pdf'
+    if ext in {'.docx'}:
+        return 'word'
+    if ext in {'.pptx'}:
+        return 'presentation'
+    if ext in {'.xlsx', '.csv'}:
+        return 'spreadsheet'
+    if ext in {'.md', '.markdown', '.adoc', '.asciidoc'}:
+        return 'markdown'
+    if ext in {'.html', '.htm', '.xhtml'}:
+        return 'html'
+    if ext in {'.reqif'}:
+        return 'reqif'
+    return 'document'
+
+
+def _annotate_element_metadata(elements: List[Dict[str, Any]], filename: str) -> None:
+    """Ensure every element contains basic provenance metadata."""
+    file_extension = os.path.splitext(filename)[1].lower()
+    source_type = _infer_source_type(file_extension)
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        metadata = element.setdefault('metadata', {})
+        metadata.setdefault('source_filename', filename)
+        metadata.setdefault('source_extension', file_extension or 'unknown')
+        metadata.setdefault('source_type', source_type)
+        metadata.setdefault('element_type', element.get('type', 'unknown'))
+
+
+def _prepare_elements(elements: Any, filename: str) -> List[Dict[str, Any]]:
+    """Normalize and annotate element structures before returning to callers."""
+    if elements is None:
+        return []
+    if isinstance(elements, dict):
+        elements = [elements]
+    if not isinstance(elements, list):
+        return []
+    _annotate_element_metadata(elements, filename)
+    return elements
 
 
 class UnstructuredServiceError(Exception):
     """Custom exception for Unstructured API service errors."""
     pass
+
+
+class DoclingProcessingError(Exception):
+    """Raised when Docling fails to convert a document."""
+    pass
+
+
+_docling_converter: Optional['DocumentConverter'] = None
+
+
+def setup_cache_directories(project_root: Optional[str] = None, silent: bool = False) -> None:
+    """
+    Setup cache directories for Docling, Hugging Face, and RapidOCR on Streamlit Cloud.
+    
+    This function ensures cache directories exist and sets environment variables
+    so that models can be downloaded to writable locations. This MUST be called
+    before any Docling, RapidOCR, or Hugging Face libraries are initialized.
+    
+    Args:
+        project_root: Optional project root directory. If None, attempts to detect it.
+    """
+    # Detect project root if not provided
+    if not project_root:
+        # Try to find project root by looking for app.py or requirements.txt
+        current = os.path.dirname(os.path.abspath(__file__))
+        for _ in range(6):  # Max 6 levels up
+            if os.path.exists(os.path.join(current, 'app.py')) or \
+               os.path.exists(os.path.join(current, 'requirements.txt')):
+                if os.path.exists(os.path.join(current, 'domain')):
+                    project_root = current
+                    break
+            current = os.path.dirname(current)
+        
+        # Fallback to current directory
+        if not project_root:
+            project_root = os.path.dirname(os.path.abspath(__file__))
+    
+    # Determine cache base directory
+    # On Streamlit Cloud, use /mount/src/{repo_name}/.cache
+    # Otherwise, use project_root/.cache
+    if os.path.exists("/mount/src"):
+        # We're on Streamlit Cloud - find repo name
+        repo_name = None
+        try:
+            for item in os.listdir("/mount/src"):
+                item_path = os.path.join("/mount/src", item)
+                if os.path.isdir(item_path) and os.path.exists(os.path.join(item_path, "app.py")):
+                    repo_name = item
+                    break
+        except (OSError, PermissionError):
+            # If we can't read /mount/src, fall back to project_root
+            pass
+        
+        if repo_name:
+            cache_base = os.path.join("/mount/src", repo_name, ".cache")
+        else:
+            # Fallback: use project_root/.cache
+            cache_base = os.path.join(project_root, ".cache")
+    else:
+        # Local development: use project_root/.cache
+        cache_base = os.path.join(project_root, ".cache")
+    
+    # Create cache directories
+    cache_dirs = {
+        "rapidocr": os.path.join(cache_base, "rapidocr"),
+        "huggingface": os.path.join(cache_base, "huggingface"),
+        "huggingface_hub": os.path.join(cache_base, "huggingface", "hub"),
+    }
+    
+    # Create directories with proper error handling
+    for cache_dir in cache_dirs.values():
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except (OSError, PermissionError) as e:
+            print(f"Warning: Could not create cache directory {cache_dir}: {e}")
+            # Continue anyway - libraries might handle missing directories
+    
+    # Set environment variables if not already set
+    # This must be done BEFORE any libraries (Docling, RapidOCR, huggingface_hub) are imported
+    if not os.getenv("RAPIDOCR_HOME"):
+        os.environ["RAPIDOCR_HOME"] = cache_dirs["rapidocr"]
+    
+    if not os.getenv("HF_HOME"):
+        os.environ["HF_HOME"] = cache_dirs["huggingface"]
+    
+    if not os.getenv("HF_HUB_CACHE"):
+        os.environ["HF_HUB_CACHE"] = cache_dirs["huggingface_hub"]
+    
+    # Update global HF_HUB_CACHE variable
+    global HF_HUB_CACHE, _cache_setup_logged
+    HF_HUB_CACHE = cache_dirs["huggingface_hub"]
+    
+    # Log cache configuration only once per Python process (not on every Streamlit rerun)
+    # This prevents the warning from appearing on every message
+    if not silent and not getattr(setup_cache_directories, '_logged', False):
+        print(f"Cache directories configured:")
+        print(f"  RAPIDOCR_HOME: {cache_dirs['rapidocr']}")
+        print(f"  HF_HOME: {cache_dirs['huggingface']}")
+        print(f"  HF_HUB_CACHE: {cache_dirs['huggingface_hub']}")
+        setup_cache_directories._logged = True
+
+
+def _reset_docling_converter() -> None:
+    """Clear cached Docling converter instance so models are reloaded on next use."""
+    global _docling_converter
+    _docling_converter = None
+
+
+def _clear_docling_model_cache() -> None:
+    """
+    Delete cached Docling model artifacts when downloads are incomplete/corrupted.
+    
+    This primarily targets the huggingface hub folder for the layout detector so the
+    next conversion attempt re-downloads missing files such as preprocessor configs.
+    """
+    cache_root = HF_HUB_CACHE
+    if not cache_root:
+        return
+    model_cache_dir = os.path.join(
+        cache_root,
+        f"models--{DOCLING_LAYOUT_MODEL_REPO.replace('/', '--')}"
+    )
+    if os.path.exists(model_cache_dir):
+        shutil.rmtree(model_cache_dir, ignore_errors=True)
+    _reset_docling_converter()
+
+
+def _get_docling_converter() -> 'DocumentConverter':
+    """
+    Lazily instantiate a Docling converter so we reuse heavy resources.
+    
+    Returns:
+        DocumentConverter: Shared Docling converter instance.
+    """
+    global _docling_converter
+    if not HAS_DOCLING:
+        raise DoclingProcessingError(
+            "Docling is not installed. Install it with `pip install docling` "
+            "or set REQVIBE_USE_UNSTRUCTURED_API=1 to fall back to the legacy Unstructured API."
+        )
+    if _docling_converter is None:
+        try:
+            _docling_converter = DocumentConverter()
+        except Exception as exc:
+            raise DoclingProcessingError(
+                f"Failed to initialize Docling converter: {exc}"
+            ) from exc
+    return _docling_converter
+
+
+def _docling_element_to_dict(element: Any) -> Dict[str, Any]:
+    """
+    Normalize Docling elements so downstream GraphRAG logic can stay untouched.
+    
+    Args:
+        element: Docling element instance (heading, paragraph, table, etc.)
+    """
+    element_type = (
+        getattr(element, "category", None)
+        or getattr(element, "type", None)
+        or element.__class__.__name__
+    )
+    text = (
+        getattr(element, "text_representation", None)
+        or getattr(element, "text", None)
+        or ""
+    )
+    metadata: Dict[str, Any] = {}
+    
+    page_number = getattr(element, "page_number", None)
+    if page_number is not None:
+        metadata["page_number"] = page_number
+    
+    bbox = getattr(element, "bbox", None)
+    if bbox is not None:
+        metadata["bbox"] = getattr(bbox, "to_list", lambda: bbox)()
+    
+    element_id = getattr(element, "content_id", None) or getattr(element, "id", None)
+    if element_id:
+        metadata["id"] = element_id
+    
+    if hasattr(element, "classification"):
+        metadata["classification"] = getattr(element, "classification")
+    
+    return {
+        "type": element_type or "unknown",
+        "text": text or "",
+        "metadata": metadata
+    }
+
+
+def _has_textual_content(elements: List[Dict[str, Any]]) -> bool:
+    """Return True if any element contains non-empty text."""
+    for element in elements:
+        text = element.get("text")
+        if isinstance(text, str) and text.strip():
+            return True
+    return False
+
+
+def _export_docling_document_text(document: Any) -> Optional[str]:
+    """
+    Try multiple exporters to recover textual content when structured elements are empty.
+    """
+    exporters = [
+        "export_to_markdown",
+        "export_to_text",
+    ]
+    for attr in exporters:
+        exporter = getattr(document, attr, None)
+        if callable(exporter):
+            try:
+                text = exporter()
+            except Exception:
+                continue
+            if isinstance(text, str) and text.strip():
+                return text
+    body = getattr(document, "body", None)
+    if body is not None:
+        text = getattr(body, "text_representation", None)
+        if isinstance(text, str) and text.strip():
+            return text
+    return None
+
+
+def _build_elements_from_text(
+    text: str,
+    base_metadata: Optional[Dict[str, Any]] = None,
+    include_page_breaks: bool = True
+) -> List[Dict[str, Any]]:
+    """
+    Convert plain text or markdown into pseudo-elements for downstream processing.
+    """
+    if not text:
+        return []
+    elements: List[Dict[str, Any]] = []
+    metadata_template = base_metadata.copy() if base_metadata else {}
+    if include_page_breaks and "\f" in text:
+        parts = text.split("\f")
+        for idx, part in enumerate(parts, start=1):
+            part_text = part.strip()
+            if not part_text:
+                continue
+            metadata = metadata_template.copy()
+            metadata["page_number"] = idx
+            elements.append({
+                "type": "page_text",
+                "text": part_text,
+                "metadata": metadata
+            })
+    else:
+        elements.append({
+            "type": "document_text",
+            "text": text.strip(),
+            "metadata": metadata_template
+        })
+    return elements
+
+
+def process_document_with_docling(file_bytes: bytes, filename: str) -> List[Dict[str, Any]]:
+    """
+    Convert documents with Docling to preserve layout-aware content such as tables and images.
+    
+    Args:
+        file_bytes: Raw file bytes.
+        filename: Original filename for extension detection.
+    """
+    suffix = os.path.splitext(filename)[1] or ".bin"
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+        tmp_file.write(file_bytes)
+        tmp_path = tmp_file.name
+    
+    try:
+        last_exc: Optional[Exception] = None
+        file_extension = os.path.splitext(filename)[1].lower()
+        base_metadata = {
+            "source_filename": filename,
+            "source_extension": file_extension or "unknown",
+            "source_type": _infer_source_type(file_extension)
+        }
+        for attempt in range(2):
+            try:
+                converter = _get_docling_converter()
+                result = converter.convert(tmp_path)
+                document = getattr(result, "document", None)
+                if document is None:
+                    raise DoclingProcessingError("Docling returned no document object.")
+                
+                elements: List[Dict[str, Any]] = []
+                raw_elements = getattr(document, "elements", None)
+                
+                if raw_elements:
+                    for element in raw_elements:
+                        elements.append(_docling_element_to_dict(element))
+                
+                if not elements or not _has_textual_content(elements):
+                    fallback_text = _export_docling_document_text(document)
+                    if fallback_text:
+                        elements = _build_elements_from_text(
+                            fallback_text,
+                            base_metadata=base_metadata
+                        )
+                
+                if not elements or not _has_textual_content(elements):
+                    raise DoclingProcessingError(
+                        "Docling returned no extractable text for this document."
+                    )
+                
+                return _prepare_elements(elements, filename)
+            except Exception as exc:
+                last_exc = exc
+                error_message = str(exc)
+                missing_processor_config = "Missing processor config file" in error_message
+                if missing_processor_config and attempt == 0:
+                    # Cached download is missing files; clear cache and retry once.
+                    _clear_docling_model_cache()
+                    continue
+                raise DoclingProcessingError(
+                    f"Docling failed to process '{filename}': {error_message}"
+                ) from exc
+        
+        if last_exc:
+            raise DoclingProcessingError(
+                f"Docling failed to process '{filename}' after retry: {last_exc}"
+            ) from last_exc
+        raise DoclingProcessingError(
+            f"Docling failed to process '{filename}' due to an unknown error."
+        )
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def get_unstructured_api_key() -> Optional[str]:
@@ -94,14 +512,13 @@ def validate_file(file_bytes: bytes, filename: str) -> tuple[bool, Optional[str]
         size_mb = len(file_bytes) / (1024 * 1024)
         return False, f"File '{filename}' is too large ({size_mb:.2f}MB). Maximum size is 10MB."
     
-    # Check file extension
-    allowed_extensions = {'.pdf', '.docx', '.reqif'}
     file_ext = os.path.splitext(filename.lower())[1]
     
-    if file_ext not in allowed_extensions:
+    if file_ext not in SUPPORTED_UPLOAD_EXTENSIONS:
+        readable_exts = ", ".join(sorted(SUPPORTED_UPLOAD_EXTENSIONS))
         return False, (
             f"File '{filename}' has unsupported format '{file_ext}'. "
-            f"Supported formats: PDF (.pdf), Word (.docx), ReqIF (.reqif)"
+            f"Supported formats: {readable_exts}"
         )
     
     return True, None
@@ -134,7 +551,7 @@ def _create_unstructured_client(api_key: str, disable_ssl_verify: bool = False):
         return None
 
 
-def _create_requests_session() -> requests.Session:
+def _create_requests_session(disable_ssl_verify: bool = False) -> requests.Session:
     """
     Create a requests session with retry logic and SSL configuration.
     Fallback method when official SDK is not available.
@@ -158,6 +575,9 @@ def _create_requests_session() -> requests.Session:
     adapter = HTTPAdapter(max_retries=retry_strategy)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
+    
+    if disable_ssl_verify and InsecureRequestWarning is not None:
+        warnings.filterwarnings('ignore', category=InsecureRequestWarning)
     
     return session
 
@@ -189,7 +609,20 @@ def process_document(
     if not is_valid:
         raise UnstructuredServiceError(error_message)
     
-    # Get API key
+    # Prefer Docling for conversion to keep tables and visual blocks intact.
+    if HAS_DOCLING:
+        try:
+            return process_document_with_docling(file_bytes, filename)
+        except DoclingProcessingError as exc:
+            raise UnstructuredServiceError(str(exc))
+    
+    if not USE_UNSTRUCTURED_API_FALLBACK:
+        raise UnstructuredServiceError(
+            "Docling is not available in this environment. Install docling>=2.0.0 "
+            "or set REQVIBE_USE_UNSTRUCTURED_API=1 to explicitly enable the legacy Unstructured API."
+        )
+    
+    # Legacy Unstructured API path (kept for backwards compatibility / opt-in fallback).
     api_key = get_unstructured_api_key()
     
     # Use local variable for SSL verification setting (may be updated if SSL errors detected)
@@ -244,7 +677,7 @@ def process_document(
                         else:
                             # Convert to string representation
                             element_dicts.append({"text": str(element)})
-                    return element_dicts
+                    return _prepare_elements(element_dicts, filename)
                 else:
                     return []
                 
@@ -317,6 +750,23 @@ def process_document(
         content_type_map = {
             '.pdf': 'application/pdf',
             '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+            '.md': 'text/markdown',
+            '.markdown': 'text/markdown',
+            '.adoc': 'text/asciidoc',
+            '.asciidoc': 'text/asciidoc',
+            '.html': 'text/html',
+            '.htm': 'text/html',
+            '.xhtml': 'application/xhtml+xml',
+            '.csv': 'text/csv',
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.tif': 'image/tiff',
+            '.tiff': 'image/tiff',
+            '.bmp': 'image/bmp',
+            '.webp': 'image/webp',
             '.reqif': 'application/reqif+xml',
         }
         content_type = content_type_map.get(file_ext, 'application/octet-stream')
@@ -366,11 +816,12 @@ def process_document(
             
             # The API returns a list of dictionaries with structured content
             if isinstance(result, list):
-                return result
+                return _prepare_elements(result, filename)
             elif isinstance(result, dict) and 'elements' in result:
-                return result['elements']
+                return _prepare_elements(result['elements'], filename)
             else:
-                return [result] if isinstance(result, dict) else result
+                normalized = [result] if isinstance(result, dict) else result
+                return _prepare_elements(normalized, filename)
                 
         except requests.exceptions.SSLError as e:
             # If SSL error and SSL verification was enabled, retry with it disabled
@@ -411,11 +862,33 @@ def process_document(
             )
 
 
+def create_single_document_json(filename: str, elements: List[Dict[str, Any]], file_size: int) -> Dict[str, Any]:
+    """Create a single-document JSON payload compatible with GraphRAG indexing."""
+    file_extension = os.path.splitext(filename)[1].lower()
+    source_type = _infer_source_type(file_extension)
+    return {
+        'documents': [
+            {
+                'filename': filename,
+                'elements': elements,
+                'element_count': len(elements),
+                'file_size': file_size,
+                'source_extension': file_extension,
+                'source_type': source_type
+            }
+        ],
+        'total_elements': len(elements),
+        'total_files': 1,
+        'total_size': file_size
+    }
+
+
 def process_multiple_documents(
     files: List[tuple[bytes, str]],
     strategy: str = "fast",
-    disable_ssl_verify: bool = False
-) -> Dict[str, Any]:
+    disable_ssl_verify: bool = False,
+    return_individual: bool = False
+) -> Union[Dict[str, Any], Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
     """
     Process multiple documents and combine their outputs.
     
@@ -460,6 +933,8 @@ def process_multiple_documents(
         'total_size': total_size
     }
     
+    individual_jsons: List[Dict[str, Any]] = []
+    
     # Process each file
     for file_bytes, filename in files:
         try:
@@ -474,16 +949,23 @@ def process_multiple_documents(
                 'filename': filename,
                 'elements': elements,
                 'element_count': len(elements),
-                'file_size': len(file_bytes)
+                'file_size': len(file_bytes),
+                'source_extension': os.path.splitext(filename)[1].lower(),
+                'source_type': _infer_source_type(os.path.splitext(filename)[1].lower())
             }
             
             results['documents'].append(document_result)
             results['total_elements'] += len(elements)
             
+            if return_individual:
+                individual_jsons.append(create_single_document_json(filename, elements, len(file_bytes)))
+            
         except UnstructuredServiceError as e:
             # Re-raise with filename context
             raise UnstructuredServiceError(f"Error processing '{filename}': {str(e)}")
     
+    if return_individual:
+        return results, individual_jsons
     return results
 
 
@@ -521,4 +1003,5 @@ def format_structured_output(result: Dict[str, Any]) -> str:
             output_lines.append("")
     
     return "\n".join(output_lines)
+
 
